@@ -1,0 +1,10 @@
+python-binance==1.0.17
+python-dotenv==1.0.1
+loguru==0.7.2
+matplotlib==3.8.2
+numpy==1.26.4
+pandas==2.2.1
+scipy==1.12.0
+schedule==1.2.1
+tqdm==4.66.2
+seaborn==0.13.2

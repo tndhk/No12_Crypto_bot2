@@ -1,0 +1,53 @@
+# Git files
+.git
+.gitignore
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and editors
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs, data, cache, results, models
+logs/
+data/
+cache/
+results/
+models/
+*.log
+
+# Distribution / packaging (Keep if needed for build)
+# build/
+# dist/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*~
+
+# Docker specific files
+Dockerfile
+.dockerignore 
