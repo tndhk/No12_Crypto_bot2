@@ -435,20 +435,19 @@ class EnhancedTradingBot:
             'atr': current.get('ATR', 0)
         }
         
-        # ここに高度なフィルタリングを追加
-#        if signal != 0:
-            # シグナルをフィルターで検証
-#            filtered_signal = self.apply_advanced_filters(signal_info)
-#            signal_info['signal'] = filtered_signal
-            
-            # マルチタイムフレーム確認を追加（オプション）
-            # if filtered_signal != 0 and hasattr(self, 'generate_multi_timeframe_signals'):
-            #     mtf_signal = self.generate_multi_timeframe_signals()
-            #     if mtf_signal != filtered_signal:  # 方向が一致しない場合
-            #         signal_info['signal'] = 0  # シグナルをキャンセル
+    # MACD履歴データの追加 (ヒストグラム傾きチェック用)
+        if len(data) > 1:
+            current = data.iloc[-1]
+            previous = data.iloc[-2]
+            signal_info['MACD_hist_prev'] = previous.get('MACD_hist', 0)
+        
+        # 最後に高度なフィルタリングを適用
+        if signal != 0:
+            filtered_signal = self.apply_advanced_filters(signal_info)
+            signal_info['signal'] = filtered_signal
         
         return signal_info
-    
+            
     def calculate_slippage(self, is_buy: bool) -> float:
         """
         スリッページをシミュレート
@@ -1500,37 +1499,50 @@ class EnhancedTradingBot:
         return 0  # 中立シグナル
 
     def apply_advanced_filters(self, signal_info):
-        """シグナル品質向上フィルター - 再調整版"""
+        """シグナル品質向上フィルター - バランス調整版"""
         signal = signal_info['signal']
+        
+        # シグナルがない場合はすぐに終了
+        if signal == 0:
+            return 0
         
         # トレンド一致度の確認
         trend_agreement = 0
         if signal > 0:  # 買いシグナル
             if signal_info['ma_signal'] > 0: trend_agreement += 1
             if signal_info['macd_signal'] > 0: trend_agreement += 1
+            if signal_info['rsi_signal'] > 0: trend_agreement += 1
+            if signal_info['bb_signal'] > 0: trend_agreement += 1
             
-            # MACDとMAは一致必須
+            # より現実的な条件: 最低2つの指標が一致が必要
             if trend_agreement < 2:
                 return 0
                 
-            # RSIが中間帯より下にあることを確認（買いのスペース）
-            if signal_info['rsi'] > 60:
+            # RSIに基づく追加フィルター (オーバーソールドに近い状態)
+            if signal_info['rsi'] > 65:  # 過度な買われすぎには買わない
                 return 0
                 
         elif signal < 0:  # 売りシグナル
             if signal_info['ma_signal'] < 0: trend_agreement += 1
             if signal_info['macd_signal'] < 0: trend_agreement += 1
+            if signal_info['rsi_signal'] < 0: trend_agreement += 1
+            if signal_info['bb_signal'] < 0: trend_agreement += 1
             
-            # MACDとMAは一致必須
+            # より現実的な条件: 最低2つの指標が一致が必要
             if trend_agreement < 2:
                 return 0
                 
-            # RSIが中間帯より上にあることを確認（売りのスペース）
-            if signal_info['rsi'] < 40:
+            # RSIに基づく追加フィルター (オーバーボウトに近い状態)
+            if signal_info['rsi'] < 35:  # 過度な売られすぎには売らない
                 return 0
         
-        return signal
+        # 過度なボラティリティの場合は取引を避ける (極端な場合のみ)
+        if signal_info.get('atr', 0) / signal_info['close'] > 0.02:  # 2%以上の非常に高いボラティリティ
+            return 0
         
+        # 全フィルターを通過した場合のみシグナルを返す
+        return signal
+
     def walk_forward_optimization(self):
         """ウォークフォワード最適化の実行"""
         # 例：データを3つの期間に分割
@@ -1643,22 +1655,39 @@ class EnhancedTradingBot:
         return df['adx'].iloc[-1] if not df['adx'].empty else 0
 
     def calculate_dynamic_risk_reward(self, signal_info):
-        """損益比を強化した動的リスク/リワード設定"""
-        # 基本設定を拡大（より大きなリワード）
+        """
+        バランスの取れた動的リスク/リワード設定
+        """
+        # 基本設定
         sl_percent = self.stop_loss_percent
-        tp_percent = self.take_profit_percent * 1.5  # 1.5倍に増加
+        tp_percent = self.take_profit_percent
         
         # トレンド状況に応じた調整
         if signal_info['ma_signal'] == signal_info['macd_signal']:
-            # トレンド一致度が高い場合はさらにリワード拡大
-            tp_percent *= 1.2
+            # トレンド一致度が高い場合は利益目標を上げる
+            tp_percent *= 1.1
         
         # ボラティリティに基づく調整
         atr_ratio = signal_info.get('atr', 0) / signal_info['close']
-        if atr_ratio > 0.01:  # 高ボラティリティ
-            # 高ボラティリティ時はより広いTPとSL
-            tp_percent *= 1.2
-            sl_percent *= 1.2
+        if atr_ratio < 0.005:  # 低ボラティリティ
+            # 低ボラティリティ時はより狭い範囲
+            tp_percent *= 0.9
+            sl_percent *= 0.9
+        elif atr_ratio > 0.01:  # 高ボラティリティ
+            # 高ボラティリティ時は広い範囲
+            tp_percent *= 1.1
+            sl_percent *= 1.1
+        
+        # RSIに基づく調整
+        rsi = signal_info['rsi']
+        if signal_info['signal'] > 0 and rsi < 30:  # 強いオーバーソールド
+            tp_percent *= 1.2  # より大きな反発を期待
+        elif signal_info['signal'] < 0 and rsi > 70:  # 強いオーバーボウト
+            tp_percent *= 1.2  # より大きな調整を期待
+        
+        # 最終チェック - 値を合理的な範囲に収める
+        sl_percent = max(1.0, min(sl_percent, 2.0))  # 1.0%〜2.0%
+        tp_percent = max(3.0, min(tp_percent, 8.0))  # 3.0%〜8.0%
         
         return sl_percent, tp_percent
 
@@ -1687,7 +1716,7 @@ class EnhancedTradingBot:
     def optimize_parameters_parallel(self, param_grid=None):
         if param_grid is None:
             param_grid = {
-                'short_window': [2],
+                'short_window': [3],
                 'long_window': [16],
                 'stop_loss_percent': [1.5],
                 'take_profit_percent': [8.0],
@@ -1696,8 +1725,8 @@ class EnhancedTradingBot:
                 'weight_macd': [0.2],
                 'weight_bb': [0.2],
                 'weight_breakout': [0.1],
-                'buy_threshold': [-0.05],
-                'sell_threshold': [-0.1],
+                'buy_threshold': [0.15,0.3,0.45,0.5],
+                'sell_threshold': [0.05,0.3,0.45,0.5],
             }
 
         logger.info("パラメータ最適化（並列処理）を開始")
@@ -1707,9 +1736,15 @@ class EnhancedTradingBot:
         logger.info(f"全組み合わせ数: {len(all_combinations)}")
 
         # データを1回だけ取得（使い回し）
-        end_time = int(datetime.now().timestamp() * 1000)
-        start_time = end_time - (self.backtest_days * 24 * 60 * 60 * 1000)
+        start_time = os.getenv("START_TIME")
+        end_time = os.getenv("END_TIME")
+
         common_data = self.get_historical_data(start_time=start_time, end_time=end_time, is_backtest=True)
+
+        logger.info(f"start_time: {start_time}")
+        logger.info(f"end_time: {end_time}")
+
+
 
         if common_data.empty:
             logger.error("データ取得に失敗")
@@ -1744,7 +1779,61 @@ class EnhancedTradingBot:
         logger.info("=" * 80)
 
         return best_result
-    
+
+    # trading_bot.py に追加する新しいメソッド
+
+    def is_favorable_market_context(self, data):
+        """
+        市場コンテキストが取引に適しているかを判断
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            過去のOHLCVデータと指標
+            
+        Returns:
+        --------
+        bool
+            取引に適した市場環境ならTrue、そうでなければFalse
+        """
+        if data.empty or len(data) < 50:
+            return False
+        
+        recent_data = data.tail(50)
+        
+        # 1. トレンド強度の確認
+        adx = self.calculate_adx(recent_data)
+        
+        # 2. ボラティリティの確認
+        atr_ratio = recent_data['ATR'].iloc[-1] / recent_data['close'].iloc[-1]
+        
+        # 3. 最近の価格変動方向
+        price_direction = recent_data['close'].pct_change(10).iloc[-1]
+        
+        # 4. 市場の方向性（トレンドか、レンジか）
+        high_low_range = (recent_data['high'].max() - recent_data['low'].min()) / recent_data['close'].mean()
+        
+        # 5. 最近の取引シグナル頻度
+        recent_signals = abs(recent_data['complex_signal']).mean()
+        
+        # 6. 状況に基づく評価
+        # トレンド状況での条件
+        if adx > 25:  # 強いトレンドがある
+            if atr_ratio > 0.015:  # ボラティリティが高い
+                return False  # 不安定な強トレンド - 避ける
+            else:
+                return True  # 安定した強トレンド - 好ましい
+        else:  # 弱いトレンドまたはレンジ相場
+            if high_low_range < 0.05:  # 狭いレンジ
+                return False  # 狭いレンジは避ける
+            if atr_ratio < 0.003:  # 極端に低いボラティリティ
+                return False  # 動きが少なすぎる
+            if recent_signals > 0.2:  # シグナル過多
+                return False  # ノイズが多い可能性
+        
+        # デフォルトでは取引を許可
+        return True
+
 def evaluate_combination(params_dict, common_data, env_dict):
         os.environ.update(env_dict)  # .env の値を再設定（必要なら）
         bot = EnhancedTradingBot()
