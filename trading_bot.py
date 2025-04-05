@@ -205,134 +205,70 @@ class EnhancedTradingBot:
         
         self.api_request_count += 1
 
-    def get_historical_data(self, start_time=None, end_time=None, limit=1000, is_backtest=False):
+    def get_historical_data(self, start_time=None, end_time=None, is_backtest=False):
         """
-        バックテスト用かライブ用かに関わらず一貫した方法で
-        歴史データを取得する汎用メソッド
-        
-        Parameters:
-        -----------
-        start_time : int, optional
-            取得開始時間（ミリ秒）
-        end_time : int, optional
-            取得終了時間（ミリ秒）
-        limit : int
-            取得するロウソク足の数
-        is_backtest : bool
-            バックテストモードかどうか
-            
-        Returns:
-        --------
-        pandas.DataFrame
-            OHLCV データ
+        start_time から end_time までのOHLCVデータをループで取得し、結合して返す
         """
-        # キャッシュファイルパスの設定
+        # キャッシュファイルパス
         cache_file = f"cache/{self.symbol}_{self.interval}_history.pkl"
+
+        # start_time, end_time を datetime に変換
+        start_dt = pd.to_datetime(start_time)
+        end_dt = pd.to_datetime(end_time)
         
-        # バックテストモードでキャッシュを使用する場合
-        if is_backtest and self.use_cached_data and os.path.exists(cache_file):
-            try:
-                # キャッシュからデータを読み込み
-                with open(cache_file, 'rb') as f:
-                    cached_data = pickle.load(f)
-                
-                # キャッシュの有効性確認（最新のデータが含まれているか）
-                if end_time and cached_data['timestamp'].max() >= pd.to_datetime(end_time, unit='ms'):
-                    logger.info(f"キャッシュからデータを読み込みました: {len(cached_data)} ロウソク足")
-                    
-                    # 指定された期間のデータを抽出
-                    if start_time:
-                        start_dt = pd.to_datetime(start_time, unit='ms')
-                        filtered_data = cached_data[cached_data['timestamp'] >= start_dt]
-                    else:
-                        filtered_data = cached_data
-                    
-                    if end_time:
-                        end_dt = pd.to_datetime(end_time, unit='ms')
-                        filtered_data = filtered_data[filtered_data['timestamp'] <= end_dt]
-                    
-                    return filtered_data
-                else:
-                    logger.info("キャッシュが古いため、新しいデータを取得します")
-            except Exception as e:
-                logger.warning(f"キャッシュ読み込みエラー: {e}")
+        logger.info(f"APIからデータをループで取得: {self.symbol}, {self.interval}")
         
-        # APIからデータを取得
-        try:
-            # ライブ環境でのみAPIクライアントを初期化
-            self._initialize_client()
-            self._check_api_rate_limit()
-            
-            logger.info(f"APIからデータを取得: {self.symbol}, {self.interval}")
-            
-            # start_timeとend_timeが指定されている場合
-            if start_time and end_time:
-                klines = self.client.get_historical_klines(
-                    symbol=self.symbol,
-                    interval=self.interval,
-                    start_str=str(start_time),
-                    end_str=str(end_time),
-                    limit=limit
-                )
-            # limit指定のみの場合
-            else:
-                klines = self.client.get_klines(
-                    symbol=self.symbol,
-                    interval=self.interval,
-                    limit=limit
-                )
-            
-            # データフレームに変換
-            data = pd.DataFrame(klines, columns=[
+        all_data = []
+        current_time = start_dt
+        self._initialize_client()
+
+
+        while current_time < end_dt:
+            # Binance API は最大1000本
+            next_time = current_time + pd.Timedelta(minutes=60 * 1000 if self.interval.endswith('h') else 1)
+            if next_time > end_dt:
+                next_time = end_dt
+
+            klines = self.client.get_historical_klines(
+                symbol=self.symbol,
+                interval=self.interval,
+                start_str=current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                end_str=next_time.strftime("%Y-%m-%d %H:%M:%S"),
+                limit=1000
+            )
+
+            if not klines:
+                break
+
+            df = pd.DataFrame(klines, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_asset_volume', 'number_of_trades',
                 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
             ])
-            
-            # データ型変換
-            data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                data[col] = data[col].astype(float)
+                df[col] = df[col].astype(float)
+
+            all_data.append(df)
+            current_time = df['timestamp'].iloc[-1] + pd.Timedelta(hours=1)  # 次の開始時刻
+
+            time.sleep(0.3)  # API制限対策
+
+        if all_data:
+            full_data = pd.concat(all_data).drop_duplicates('timestamp').sort_values('timestamp')
             
-            # バックテスト用にデータをキャッシュ
-            if is_backtest and len(data) > 0:
-                # 既存のキャッシュと結合
-                if os.path.exists(cache_file):
-                    try:
-                        with open(cache_file, 'rb') as f:
-                            cached_data = pickle.load(f)
-                        
-                        # 重複を避けるために結合
-                        combined_data = pd.concat([cached_data, data])
-                        combined_data = combined_data.drop_duplicates(subset=['timestamp'])
-                        
-                        # 時間でソート
-                        combined_data = combined_data.sort_values('timestamp')
-                        
-                        with open(cache_file, 'wb') as f:
-                            pickle.dump(combined_data, f)
-                            
-                        logger.info(f"キャッシュ更新: {len(combined_data)} ロウソク足")
-                    except Exception as e:
-                        logger.warning(f"キャッシュ更新エラー: {e}")
-                        # 新規キャッシュを作成
-                        with open(cache_file, 'wb') as f:
-                            pickle.dump(data, f)
-                else:
-                    # 新規キャッシュを作成
-                    with open(cache_file, 'wb') as f:
-                        pickle.dump(data, f)
-                    logger.info(f"新規キャッシュ作成: {len(data)} ロウソク足")
-            
-            return data
-                
-        except BinanceAPIException as e:
-            logger.error(f"APIエラー: {e}")
-            return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"データ取得エラー: {e}")
-            logger.error(traceback.format_exc())
-            return pd.DataFrame()
+            # キャッシュ保存（オプション）
+            if is_backtest:
+                os.makedirs("cache", exist_ok=True)
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(full_data, f)
+                logger.info(f"キャッシュ保存完了: {len(full_data)} ロウソク足")
+
+            return full_data
+
+        return pd.DataFrame()
+
     
     def calculate_indicators(self, data):
         """
@@ -888,8 +824,16 @@ class EnhancedTradingBot:
         logger.info(f"最適化する組み合わせ数: {total_combinations}")
         
         # バックテスト用のデータを取得（一度だけ）
-        end_time = int(time.time() * 1000)
-        start_time = end_time - (self.backtest_days * 24 * 60 * 60 * 1000)
+#        end_time = int(time.time() * 1000)
+#        start_time = end_time - (self.backtest_days * 24 * 60 * 60 * 1000)
+
+        start_time = os.getenv("START_TIME")
+        end_time = os.getenv("END_TIME")
+
+        if start_time:
+            start_time = pd.to_datetime(start_time)
+        if end_time:
+            end_time = pd.to_datetime(end_time)
         
         data = self.get_historical_data(
             start_time=start_time, 
@@ -1195,12 +1139,24 @@ class EnhancedTradingBot:
 
         logger.add(sys.stderr, level="DEBUG", format="{time} | {level} | {message}")
 
+        # 環境変数から読み込み
+        start_time_str = os.getenv("START_TIME")
+        end_time_str = os.getenv("END_TIME")
+
+        # ミリ秒に変換（Binance API用）
+        start_time = pd.to_datetime(start_time_str) if start_time_str else None
+        end_time = pd.to_datetime(end_time_str) if end_time_str else None
+
+        # 呼び出し例
+        df = self.get_historical_data(start_time=start_time, end_time=end_time, is_backtest=True)
+
+
         # シグナル出力用のデバッグフラグ
         debug_signals = True
 
         # 過去データの取得
-        end_time = int(time.time() * 1000)
-        start_time = end_time - (self.backtest_days * 24 * 60 * 60 * 1000)
+#        end_time = int(time.time() * 1000)
+#        start_time = end_time - (self.backtest_days * 24 * 60 * 60 * 1000)
         
         try:
             # 効率的なデータ取得
@@ -1731,28 +1687,18 @@ class EnhancedTradingBot:
     def optimize_parameters_parallel(self, param_grid=None):
         if param_grid is None:
             param_grid = {
-                'short_window': [2, 3],
-                'long_window': [6,10,16],
-                'stop_loss_percent': [1.5,2.0,2.5],
-                'take_profit_percent': [5.0, 6.0, 8.0],
+                'short_window': [2],
+                'long_window': [16],
+                'stop_loss_percent': [1.5],
+                'take_profit_percent': [8.0],
                 'weight_ma': [0.2],
                 'weight_rsi': [0.3],
                 'weight_macd': [0.2],
                 'weight_bb': [0.2],
-                'weight_breakout': [0.0, 0.1],
-                'buy_threshold': [-0.1,-0.05],
-                'sell_threshold': [-0.2, -0.1],
+                'weight_breakout': [0.1],
+                'buy_threshold': [-0.05],
+                'sell_threshold': [-0.1],
             }
-
-
-
-
-
-
-
-
-
-
 
         logger.info("パラメータ最適化（並列処理）を開始")
 
@@ -1828,6 +1774,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
