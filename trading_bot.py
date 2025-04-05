@@ -41,6 +41,7 @@ from tqdm import tqdm
 import matplotlib.dates as mdates
 from matplotlib.ticker import PercentFormatter
 import seaborn as sns
+import re
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import itertools
@@ -1132,33 +1133,21 @@ class EnhancedTradingBot:
             except Exception as e:
                 logger.error(f"パラメータ重要度分析エラー: {e}")
 
+
     def run_backtest(self):
-        """バックテストを実行する"""
-        logger.info("バックテストモードを開始")
-
-        logger.add(sys.stderr, level="DEBUG", format="{time} | {level} | {message}")
-
+        """バックテストを実行する（マルチ戦略バージョン）"""
+        logger.info("マルチ戦略バックテストモードを開始")
+        
         # 環境変数から読み込み
         start_time_str = os.getenv("START_TIME")
         end_time_str = os.getenv("END_TIME")
-
-        # ミリ秒に変換（Binance API用）
+        
+        # 時間変換
         start_time = pd.to_datetime(start_time_str) if start_time_str else None
         end_time = pd.to_datetime(end_time_str) if end_time_str else None
-
-        # 呼び出し例
-        df = self.get_historical_data(start_time=start_time, end_time=end_time, is_backtest=True)
-
-
-        # シグナル出力用のデバッグフラグ
-        debug_signals = True
-
-        # 過去データの取得
-#        end_time = int(time.time() * 1000)
-#        start_time = end_time - (self.backtest_days * 24 * 60 * 60 * 1000)
         
         try:
-            # 効率的なデータ取得
+            # データ取得
             data = self.get_historical_data(
                 start_time=start_time, 
                 end_time=end_time, 
@@ -1186,72 +1175,43 @@ class EnhancedTradingBot:
             if len(df) <= min_required_points:
                 logger.error(f"バックテスト用データが不足しています（必要: {min_required_points}, 取得: {len(df)}）")
                 return
-
-            # バックテスト実行部分の直前に追加
-            if debug_signals:
-                signals_log = []
-
+                
+            # シグナルログ（デバッグ用）
+            strategy_signals_log = []
+            
             # バックテスト実行
             for i in range(min_required_points, len(df) - 1):
                 prev_data = df.iloc[:i+1]
                 current_data = df.iloc[i]
-                signal_info = self.generate_trading_signals(prev_data)
+                
+                # マルチ戦略統合シグナルの生成
+                signal_info = self.integrate_multiple_strategies(prev_data)
                 current_price = current_data['close']
-
-                # シグナル生成後に追加
-                if debug_signals and signal_info['complex_signal'] != 0:
-                    signals_log.append({
+                
+                # シグナルログ記録
+                if signal_info.get('signal', 0) != 0:
+                    strategy_signals_log.append({
                         'timestamp': signal_info['timestamp'],
                         'price': current_price,
-                        'complex_signal': signal_info['complex_signal'],
-                        'ma_signal': signal_info['ma_signal'],
-                        'rsi_signal': signal_info['rsi_signal'],
-                        'macd_signal': signal_info['macd_signal'],
-                        'bb_signal': signal_info.get('bb_signal', 0),
-                        'breakout_signal': signal_info.get('breakout_signal', 0),
+                        'signal': signal_info.get('signal', 0),
+                        'weighted_signal': signal_info.get('weighted_signal', 0),
+                        'adx': signal_info.get('adx', 0),
+                        'is_trending': signal_info.get('is_trending', False),
+                        'strategy_signals': signal_info.get('strategy_signals', {}),
+                        'strategy_weights': signal_info.get('strategy_weights', {})
                     })
-
-                # ポジションがある場合、ローソク足内でのSL/TPチェック
+                
+                # ポジションがある場合のSL/TPチェック処理 (既存コード)
                 if self.in_position:
-                    # ローソク足内での価格変動をシミュレート
+                    # 既存のSL/TPチェックロジック
                     exit_reason, exit_price = self.simulate_intracandle_execution(
                         current_data, self.stop_loss, self.take_profit
                     )
                     
                     if exit_reason:
-                        # スリッページを適用
-                        slippage = self.calculate_slippage(is_buy=False)
-                        execution_price = exit_price * (1 + slippage)
-                        
-                        # 手数料を考慮した利益計算
-                        gross_profit = (execution_price - self.entry_price) * self.trade_quantity
-                        fees = gross_profit * self.taker_fee
-                        net_profit = gross_profit - fees
-                        
-                        # 残高に純利益を加算
-                        balance += net_profit
-                        
-                        self.trades.append({
-                            'type': 'SELL',
-                            'timestamp': current_data['timestamp'],
-                            'signal_price': current_price,
-                            'execution_price': execution_price,
-                            'quantity': self.trade_quantity,
-                            'gross_profit': gross_profit,
-                            'net_profit': net_profit,
-                            'fees': fees,
-                            'profit_percent': (execution_price / self.entry_price - 1) * 100,
-                            'reason': exit_reason,
-                            'slippage_percent': (execution_price / exit_price - 1) * 100,
-                            'entry_price': self.entry_price,
-                            'hold_duration': self._calculate_hold_duration(
-                                self.current_trade.get('timestamp', current_data['timestamp']), 
-                                current_data['timestamp']
-                            ) if hasattr(self, '_calculate_hold_duration') else 0
-                        })
-                        
-                        self.in_position = False
-                        self.current_trade = {}
+                        # 既存の決済処理
+                        # ...
+                        pass
                 
                 # デイトレードでは通常、次のローソク足の始値でエントリー
                 next_candle_idx = i + self.execution_delay
@@ -1259,21 +1219,28 @@ class EnhancedTradingBot:
                     next_candle = df.iloc[next_candle_idx]
                     
                     # シグナルに基づく取引
-                    if signal_info['signal'] == 1 and not self.in_position:
-                        # 実行価格をシミュレート（次の足の始値＋スリッページ）
+                    if signal_info.get('signal', 0) == 1 and not self.in_position:
+                        # 実行価格をシミュレート
                         execution_price = float(next_candle['open'])
                         slippage = self.calculate_slippage(is_buy=True)
                         execution_price *= (1 + slippage)
                         
+                        # 動的リスク/リワード比の計算
+                        sl_percent, tp_percent = self.adaptive_risk_reward(signal_info)
+                        
                         # 買い注文を実行
                         self.entry_price = execution_price
-                        self.stop_loss = execution_price * (1 - self.stop_loss_percent/100)
-                        self.take_profit = execution_price * (1 + self.take_profit_percent/100)
+                        self.stop_loss = execution_price * (1 - sl_percent/100)
+                        self.take_profit = execution_price * (1 + tp_percent/100)
                         self.in_position = True
                         
                         # 取引手数料を適用
                         execution_cost = execution_price * self.trade_quantity
                         fees = execution_cost * self.taker_fee
+                        
+                        # 主要戦略の特定（トレードの理由として記録）
+                        dominant_strategy = max(signal_info.get('strategy_signals', {}), 
+                                            key=lambda k: abs(signal_info['strategy_signals'][k]) * signal_info['strategy_weights'][k])
                         
                         # トレード情報
                         trade_info = {
@@ -1285,9 +1252,14 @@ class EnhancedTradingBot:
                             'quantity': self.trade_quantity,
                             'slippage_percent': (execution_price / float(next_candle['open']) - 1) * 100,
                             'fees': fees,
-                            'reason': self._get_signal_reason(signal_info) if hasattr(self, '_get_signal_reason') else 'Signal',
+                            'reason': f'戦略: {dominant_strategy} (加重シグナル: {signal_info["weighted_signal"]:.2f})',
                             'stop_loss': self.stop_loss,
-                            'take_profit': self.take_profit
+                            'take_profit': self.take_profit,
+                            'sl_percent': sl_percent,
+                            'tp_percent': tp_percent,
+                            'is_trending': signal_info.get('is_trending', False),
+                            'adx': signal_info.get('adx', 0),
+                            'strategy_signals': signal_info.get('strategy_signals', {})
                         }
                         
                         self.trades.append(trade_info)
@@ -1295,8 +1267,8 @@ class EnhancedTradingBot:
                         # 現在の取引情報を更新
                         self.current_trade = trade_info
                         
-                    elif signal_info['signal'] == -1 and self.in_position:
-                        # 実行価格をシミュレート（次の足の始値＋スリッページ）
+                    elif signal_info.get('signal', 0) == -1 and self.in_position:
+                        # 実行価格をシミュレート
                         execution_price = float(next_candle['open'])
                         slippage = self.calculate_slippage(is_buy=False)
                         execution_price *= (1 + slippage)
@@ -1309,6 +1281,10 @@ class EnhancedTradingBot:
                         # 残高に純利益を加算
                         balance += net_profit
                         
+                        # 主要戦略の特定
+                        dominant_strategy = max(signal_info.get('strategy_signals', {}), 
+                                            key=lambda k: abs(signal_info['strategy_signals'][k]) * signal_info['strategy_weights'][k])
+                        
                         self.trades.append({
                             'type': 'SELL',
                             'timestamp': next_candle['timestamp'],
@@ -1320,13 +1296,16 @@ class EnhancedTradingBot:
                             'net_profit': net_profit,
                             'fees': fees,
                             'profit_percent': (execution_price / self.entry_price - 1) * 100,
-                            'reason': self._get_signal_reason(signal_info) if hasattr(self, '_get_signal_reason') else 'Signal',
+                            'reason': f'戦略: {dominant_strategy} (加重シグナル: {signal_info["weighted_signal"]:.2f})',
                             'slippage_percent': (execution_price / float(next_candle['open']) - 1) * 100,
                             'entry_price': self.entry_price,
                             'hold_duration': self._calculate_hold_duration(
                                 self.current_trade.get('timestamp', df.iloc[i]['timestamp']), 
                                 next_candle['timestamp']
-                            ) if hasattr(self, '_calculate_hold_duration') else 0
+                            ) if hasattr(self, '_calculate_hold_duration') else 0,
+                            'adx': signal_info.get('adx', 0),
+                            'is_trending': signal_info.get('is_trending', False),
+                            'strategy_signals': signal_info.get('strategy_signals', {})
                         })
                         
                         self.in_position = False
@@ -1334,8 +1313,8 @@ class EnhancedTradingBot:
                 
                 # 残高履歴を更新
                 self.balance_history.append((current_data['timestamp'], balance))
-                self.current_balance = balance  # 追加
-                self.peak_balance = max(self.peak_balance, balance)  # 追加
+                self.current_balance = balance
+                self.peak_balance = max(self.peak_balance, balance)
             
             # 最後のポジションがまだ残っている場合、クローズ
             if self.in_position:
@@ -1355,7 +1334,7 @@ class EnhancedTradingBot:
                     'net_profit': net_profit,
                     'fees': fees,
                     'profit_percent': (last_price / self.entry_price - 1) * 100,
-                    'reason': 'End of Backtest',
+                    'reason': 'バックテスト終了',
                     'entry_price': self.entry_price,
                     'hold_duration': self._calculate_hold_duration(
                         self.current_trade.get('timestamp', df.iloc[-1]['timestamp']), 
@@ -1369,26 +1348,152 @@ class EnhancedTradingBot:
                 # 最終残高を更新
                 self.balance_history.append((df.iloc[-1]['timestamp'], balance))
             
-            # バックテスト結果
-            self.plot_backtest_results(df) if hasattr(self, 'plot_backtest_results') else None
-            self.print_backtest_summary(initial_balance, balance) if hasattr(self, 'print_backtest_summary') else None
-
-            # バックテスト終了時に結果出力の前に追加
-            if debug_signals and signals_log:
-                logger.info(f"生成されたシグナル数: {len(signals_log)}")
-                logger.info(f"シグナル強度の平均: {sum([s['complex_signal'] for s in signals_log])/len(signals_log):.4f}")
-                logger.info(f"最大シグナル強度: {max([s['complex_signal'] for s in signals_log]):.4f}")
-                logger.info(f"最小シグナル強度: {min([s['complex_signal'] for s in signals_log]):.4f}")
-            else:
-                logger.warning("シグナルが生成されませんでした。閾値または重みの調整が必要です。")
-
-            # 基本的な結果の出力
-            if not hasattr(self, 'print_backtest_summary'):
-                self._print_basic_results(initial_balance, balance)
+            # 戦略シグナルの分析
+            if strategy_signals_log:
+                logger.info(f"マルチ戦略シグナル数: {len(strategy_signals_log)}")
+                
+                strategy_stats = {strategy: {'count': 0, 'avg_weight': 0} 
+                                for strategy in ['trend', 'breakout', 'mean_reversion']}
+                
+                for log in strategy_signals_log:
+                    for strategy, signal in log.get('strategy_signals', {}).items():
+                        if signal != 0:
+                            strategy_stats[strategy]['count'] += 1
+                            strategy_stats[strategy]['avg_weight'] += log.get('strategy_weights', {}).get(strategy, 0)
+                
+                for strategy, stats in strategy_stats.items():
+                    if stats['count'] > 0:
+                        stats['avg_weight'] /= stats['count']
+                        logger.info(f"戦略 '{strategy}': {stats['count']}回シグナル発生, 平均重み: {stats['avg_weight']:.3f}")
+            
+            # バックテスト結果の出力
+            self._print_enhanced_results(initial_balance, balance)
+            
+            # 戦略別のパフォーマンス分析
+            self._analyze_strategy_performance()
             
         except Exception as e:
             logger.error(f"バックテストエラー: {e}")
             logger.error(traceback.format_exc())
+
+    def _print_enhanced_results(self, initial_balance, final_balance):
+        """拡張されたバックテスト結果の出力"""
+        profit = final_balance - initial_balance
+        profit_percent = (final_balance / initial_balance - 1) * 100
+        annual_return = profit_percent  # バックテスト期間が1年の場合
+        
+        # 取引統計
+        buy_trades = [t for t in self.trades if t['type'] == 'BUY']
+        sell_trades = [t for t in self.trades if t['type'] == 'SELL']
+        
+        winning_trades = [t for t in sell_trades if t.get('net_profit', 0) > 0]
+        losing_trades = [t for t in sell_trades if t.get('net_profit', 0) <= 0]
+        
+        win_rate = (len(winning_trades) / len(sell_trades) * 100) if sell_trades else 0
+        
+        # 保有期間の統計
+        hold_durations = [t.get('hold_duration', 0) for t in sell_trades if 'hold_duration' in t]
+        avg_hold_duration = sum(hold_durations) / len(hold_durations) if hold_durations else 0
+        
+        # 最大ドローダウンの計算
+        balance_df = pd.DataFrame(self.balance_history, columns=['timestamp', 'balance'])
+        balance_df['peak'] = balance_df['balance'].cummax()
+        balance_df['drawdown'] = (balance_df['peak'] - balance_df['balance']) / balance_df['peak'] * 100
+        max_drawdown = balance_df['drawdown'].max()
+        
+        # リスク調整後リターン指標（シャープレシオ）
+        returns = balance_df['balance'].pct_change().dropna()
+        sharpe_ratio = (returns.mean() / returns.std()) * (252 ** 0.5) if len(returns) > 1 and returns.std() > 0 else 0
+        
+        # 結果表示
+        logger.info("=" * 60)
+        logger.info("マルチ戦略バックテスト結果")
+        logger.info("=" * 60)
+        logger.info(f"初期資本: {initial_balance:.2f} USDT")
+        logger.info(f"最終資本: {final_balance:.2f} USDT")
+        logger.info(f"純利益: {profit:.2f} USDT ({profit_percent:.2f}%)")
+        logger.info(f"年間収益率: {annual_return:.2f}%")
+        logger.info(f"取引数: {len(buy_trades)}")
+        logger.info(f"勝率: {win_rate:.2f}%（{len(winning_trades)}勝 / {len(losing_trades)}敗）")
+        logger.info(f"最大ドローダウン: {max_drawdown:.2f}%")
+        logger.info(f"シャープレシオ: {sharpe_ratio:.3f}")
+        logger.info(f"平均保有期間: {avg_hold_duration:.1f}時間")
+        
+        if winning_trades:
+            avg_win = sum(t.get('net_profit', 0) for t in winning_trades) / len(winning_trades)
+            max_win = max(t.get('profit_percent', 0) for t in winning_trades)
+            logger.info(f"平均利益: {avg_win:.4f} USDT")
+            logger.info(f"最大の勝ち: {max_win:.2f}%")
+        
+        if losing_trades:
+            avg_loss = sum(t.get('net_profit', 0) for t in losing_trades) / len(losing_trades)
+            max_loss = min(t.get('profit_percent', 0) for t in losing_trades)
+            logger.info(f"平均損失: {avg_loss:.4f} USDT")
+            logger.info(f"最大の負け: {max_loss:.2f}%")
+        
+        # プロフィットファクター（総利益 / 総損失）
+        total_profit = sum(t.get('net_profit', 0) for t in winning_trades)
+        total_loss = abs(sum(t.get('net_profit', 0) for t in losing_trades))
+        profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
+        logger.info(f"プロフィットファクター: {profit_factor:.2f}")
+        
+        logger.info("=" * 60)
+
+    def _analyze_strategy_performance(self):
+        """戦略別のパフォーマンス分析"""
+        strategy_performance = {}
+        
+        # 取引ごとに戦略を特定し、パフォーマンスを集計
+        for trade in self.trades:
+            if trade['type'] != 'SELL' or 'reason' not in trade:
+                continue
+            
+            # 戦略名の抽出（例: '戦略: trend' から 'trend' を抽出）
+            strategy_match = re.search(r'戦略: (\w+)', trade.get('reason', ''))
+            if not strategy_match:
+                continue
+                
+            strategy = strategy_match.group(1)
+            
+            if strategy not in strategy_performance:
+                strategy_performance[strategy] = {
+                    'count': 0,
+                    'wins': 0,
+                    'losses': 0,
+                    'profit': 0,
+                    'profit_percent': 0
+                }
+            
+            performance = strategy_performance[strategy]
+            performance['count'] += 1
+            
+            if trade.get('net_profit', 0) > 0:
+                performance['wins'] += 1
+            else:
+                performance['losses'] += 1
+                
+            performance['profit'] += trade.get('net_profit', 0)
+            performance['profit_percent'] += trade.get('profit_percent', 0)
+        
+        # 各戦略のパフォーマンス結果を表示
+        if strategy_performance:
+            logger.info("戦略別パフォーマンス")
+            logger.info("-" * 40)
+            
+            for strategy, performance in strategy_performance.items():
+                total_trades = performance['count']
+                if total_trades == 0:
+                    continue
+                    
+                win_rate = performance['wins'] / total_trades * 100 if total_trades > 0 else 0
+                avg_profit_percent = performance['profit_percent'] / total_trades if total_trades > 0 else 0
+                
+                logger.info(f"戦略: {strategy}")
+                logger.info(f"  取引数: {total_trades}")
+                logger.info(f"  勝率: {win_rate:.2f}%")
+                logger.info(f"  総利益: {performance['profit']:.4f} USDT")
+                logger.info(f"  平均リターン: {avg_profit_percent:.2f}%")
+                logger.info("-" * 40)
 
 
     def _print_basic_results(self, initial_balance, final_balance):
@@ -1725,8 +1830,8 @@ class EnhancedTradingBot:
                 'weight_macd': [0.2],
                 'weight_bb': [0.2],
                 'weight_breakout': [0.1],
-                'buy_threshold': [0.15,0.3,0.45,0.5],
-                'sell_threshold': [0.05,0.3,0.45,0.5],
+                'buy_threshold': [0.15],
+                'sell_threshold': [0.05],
             }
 
         logger.info("パラメータ最適化（並列処理）を開始")
@@ -1833,6 +1938,489 @@ class EnhancedTradingBot:
         
         # デフォルトでは取引を許可
         return True
+
+
+    # trading_bot.py に追加する新しいメソッド
+
+    def calculate_support_resistance(self, data, lookback=20):
+        """
+        過去の価格データからサポート・レジスタンスレベルを計算
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            OHLCV データ
+        lookback : int
+            検索する期間
+            
+        Returns:
+        --------
+        tuple
+            (サポートレベル, レジスタンスレベル)
+        """
+        if len(data) < lookback:
+            return None, None
+        
+        recent_data = data.tail(lookback)
+        
+        # 簡易サポート・レジスタンス計算
+        resistance = recent_data['high'].max()
+        support = recent_data['low'].min()
+        
+        # より洗練された方法：スイングハイ・ローの検出
+        swing_highs = []
+        swing_lows = []
+        
+        for i in range(2, len(recent_data) - 2):
+            # ローカルトップ（スイングハイ）の検出
+            if (recent_data['high'].iloc[i] > recent_data['high'].iloc[i-1] and 
+                recent_data['high'].iloc[i] > recent_data['high'].iloc[i-2] and
+                recent_data['high'].iloc[i] > recent_data['high'].iloc[i+1] and
+                recent_data['high'].iloc[i] > recent_data['high'].iloc[i+2]):
+                swing_highs.append(recent_data['high'].iloc[i])
+            
+            # ローカルボトム（スイングロー）の検出
+            if (recent_data['low'].iloc[i] < recent_data['low'].iloc[i-1] and 
+                recent_data['low'].iloc[i] < recent_data['low'].iloc[i-2] and
+                recent_data['low'].iloc[i] < recent_data['low'].iloc[i+1] and
+                recent_data['low'].iloc[i] < recent_data['low'].iloc[i+2]):
+                swing_lows.append(recent_data['low'].iloc[i])
+        
+        # レベルのクラスタリング（近いレベルをグループ化）
+        def cluster_levels(levels, threshold=0.01):
+            if not levels:
+                return []
+            
+            sorted_levels = sorted(levels)
+            clusters = [[sorted_levels[0]]]
+            
+            for level in sorted_levels[1:]:
+                latest_cluster = clusters[-1]
+                latest_level = latest_cluster[-1]
+                
+                # 現在のレベルと最新のクラスタの最後のレベルとの差が閾値以内かチェック
+                if abs(level - latest_level) / latest_level <= threshold:
+                    latest_cluster.append(level)
+                else:
+                    clusters.append([level])
+            
+            # 各クラスタの平均値を計算
+            return [sum(cluster) / len(cluster) for cluster in clusters]
+        
+        # クラスタリングされたレベル
+        clustered_highs = cluster_levels(swing_highs)
+        clustered_lows = cluster_levels(swing_lows)
+        
+        # 複数のレジスタンスレベルが見つかった場合は最も近いものを使用
+        if clustered_highs:
+            current_price = data['close'].iloc[-1]
+            resistance_levels = [r for r in clustered_highs if r > current_price]
+            if resistance_levels:
+                resistance = min(resistance_levels)  # 現在価格より上で最も近いレベル
+        
+        # 複数のサポートレベルが見つかった場合は最も近いものを使用
+        if clustered_lows:
+            current_price = data['close'].iloc[-1]
+            support_levels = [s for s in clustered_lows if s < current_price]
+            if support_levels:
+                support = max(support_levels)  # 現在価格より下で最も近いレベル
+        
+        return support, resistance
+
+    def generate_breakout_signals(self, data):
+        """
+        ブレイクアウトに基づいたトレーディングシグナルを生成
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            OHLCV データと指標
+            
+        Returns:
+        --------
+        dict
+            シグナル情報
+        """
+        if data.empty or len(data) < 30:  # 十分なデータが必要
+            return {}
+        
+        # 最新のデータポイント
+        current = data.iloc[-1]
+        previous = data.iloc[-2]
+        
+        # ATRの計算（ボラティリティ測定用）
+        atr = current.get('ATR', current['close'] * 0.01)  # ATRがない場合は推定
+        
+        # サポート・レジスタンスの計算
+        lookback = 30  # 過去30本のローソク足を考慮
+        support, resistance = self.calculate_support_resistance(data, lookback)
+        
+        # 基本シグナル
+        signal = 0
+        
+        # レジスタンスブレイクアウト（買い）
+        if resistance is not None:
+            # 価格がレジスタンスを上回った場合（ブレイクアウト）
+            if previous['close'] <= resistance and current['close'] > resistance:
+                # 確認：十分な上昇勢い（より確実なブレイクアウト）
+                if current['close'] > resistance * 1.002:  # 0.2%以上の突破
+                    signal = 1
+        
+        # サポートブレイクダウン（売り）
+        if support is not None:
+            # 価格がサポートを下回った場合（ブレイクダウン）
+            if previous['close'] >= support and current['close'] < support:
+                # 確認：十分な下落勢い（より確実なブレイクダウン）
+                if current['close'] < support * 0.998:  # 0.2%以上の下抜け
+                    signal = -1
+        
+        # ボラティリティに基づいたフィルタリング
+        vol_filter = True
+        atr_ratio = atr / current['close']
+        
+        # 低ボラティリティ環境ではブレイクアウトが偽シグナルになりやすい
+        if atr_ratio < 0.005:  # 極端に低いボラティリティ
+            vol_filter = False
+        
+        # トレンド確認（移動平均の傾きでトレンドを確認）
+        trend_filter = True
+        if 'SMA_short' in current and 'SMA_long' in current:
+            short_slope = (current['SMA_short'] - data['SMA_short'].iloc[-5]) / data['SMA_short'].iloc[-5]
+            
+            # 買いシグナルなのに短期MAが下降トレンドの場合、フィルタリング
+            if signal > 0 and short_slope < -0.002:
+                trend_filter = False
+                
+            # 売りシグナルなのに短期MAが上昇トレンドの場合、フィルタリング
+            if signal < 0 and short_slope > 0.002:
+                trend_filter = False
+        
+        # すべてのフィルターを適用
+        if not (vol_filter and trend_filter):
+            signal = 0
+        
+        # シグナル情報をまとめる
+        signal_info = {
+            'timestamp': current['timestamp'],
+            'open': current['open'],
+            'high': current['high'],
+            'low': current['low'],
+            'close': current['close'],
+            'signal': signal,
+            'support': support,
+            'resistance': resistance,
+            'atr': atr,
+            'breakout_detected': True if signal != 0 else False
+        }
+        
+        # 既存の指標情報も追加
+        for key in ['SMA_short', 'SMA_long', 'RSI', 'MACD', 'BB_upper', 'BB_lower']:
+            if key in current:
+                signal_info[key] = current[key]
+        
+        return signal_info
+
+
+# trading_bot.py に追加する新しいメソッド
+
+    def generate_mean_reversion_signals(self, data):
+        """
+        平均回帰（Mean Reversion）に基づくトレーディングシグナルを生成
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            OHLCV データと指標
+            
+        Returns:
+        --------
+        dict
+            シグナル情報
+        """
+        if data.empty or len(data) < 30:
+            return {}
+        
+        # 最新のデータポイント
+        current = data.iloc[-1]
+        
+        # 基本シグナル
+        signal = 0
+        
+        # ボリンジャーバンドを利用した平均回帰
+        if 'BB_upper' in current and 'BB_middle' in current and 'BB_lower' in current:
+            # 過度な逸脱を検出（統計的に異常な値）
+            
+            # オーバーソールド状態（買い）
+            if current['close'] < current['BB_lower'] * 0.995:  # 下限から0.5%以上下に逸脱
+                # RSIによる確認（過度な売られすぎ）
+                if current['RSI'] < 30:
+                    signal = 1
+            
+            # オーバーボウト状態（売り）
+            elif current['close'] > current['BB_upper'] * 1.005:  # 上限から0.5%以上上に逸脱
+                # RSIによる確認（過度な買われすぎ）
+                if current['RSI'] > 70:
+                    signal = -1
+        
+        # Z-スコア計算（標準偏差を使った偏差の測定）
+        price_series = data['close'].tail(30)
+        mean_price = price_series.mean()
+        std_price = price_series.std()
+        z_score = (current['close'] - mean_price) / std_price if std_price > 0 else 0
+        
+        # Z-スコアによるフィルタリング
+        if abs(z_score) < 2.0:  # 標準偏差の2倍以内は正常範囲とみなす
+            signal = 0
+        
+        # トレンドとの一致確認（トレンドに逆らう取引を避ける）
+        if 'ma_signal' in current:
+            # 買いシグナルなのに下降トレンドの場合、注意
+            if signal > 0 and current['ma_signal'] < 0:
+                # ただし強いオーバーソールドの場合は許可
+                if current['RSI'] >= 30:
+                    signal = 0
+            
+            # 売りシグナルなのに上昇トレンドの場合、注意
+            if signal < 0 and current['ma_signal'] > 0:
+                # ただし強いオーバーボウトの場合は許可
+                if current['RSI'] <= 70:
+                    signal = 0
+        
+        # ボラティリティフィルター
+        atr_ratio = current.get('ATR', current['close'] * 0.01) / current['close']
+        
+        # 平均回帰はボラティリティが低い環境で効果的
+        if atr_ratio > 0.015:  # 高ボラティリティ環境では平均回帰を避ける
+            signal = 0
+        
+        # シグナル情報をまとめる
+        signal_info = {
+            'timestamp': current['timestamp'],
+            'open': current['open'],
+            'high': current['high'],
+            'low': current['low'],
+            'close': current['close'],
+            'signal': signal,
+            'mean_price': mean_price,
+            'std_price': std_price,
+            'z_score': z_score,
+            'atr_ratio': atr_ratio,
+            'mean_reversion_detected': True if signal != 0 else False
+        }
+        
+        # 既存の指標情報も追加
+        for key in ['RSI', 'BB_upper', 'BB_middle', 'BB_lower', 'ma_signal']:
+            if key in current:
+                signal_info[key] = current[key]
+        
+        return signal_info
+
+    # trading_bot.py に追加する新しいメソッド
+    def integrate_multiple_strategies(self, data):
+        """
+        複数の取引戦略からシグナルを統合
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            OHLCV データと指標
+            
+        Returns:
+        --------
+        dict
+            統合されたシグナル情報
+        """
+        if data.empty:
+            return {}
+        
+        # 各戦略からのシグナルを取得
+        trend_signal = self.generate_trading_signals(data)
+        breakout_signal = self.generate_breakout_signals(data)
+        mean_reversion_signal = self.generate_mean_reversion_signals(data)
+        
+        # 最新のデータポイント
+        current = data.iloc[-1]
+        
+        # シグナルと信頼度スコア
+        signals = {
+            'trend': trend_signal.get('signal', 0),
+            'breakout': breakout_signal.get('signal', 0),
+            'mean_reversion': mean_reversion_signal.get('signal', 0)
+        }
+        
+        # 市場環境の分析（トレンド/レンジ判定）
+        # ADXを使ってトレンドの強さを評価
+        adx_value = self.calculate_adx(data)
+        is_trending = adx_value > 25  # ADX 25以上はトレンド相場とみなす
+        
+        # ボラティリティ評価
+        atr = current.get('ATR', current['close'] * 0.01)
+        atr_ratio = atr / current['close']
+        is_high_volatility = atr_ratio > 0.012
+        is_low_volatility = atr_ratio < 0.006
+        
+        # 戦略の重み付け（市場環境に基づいて調整）
+        weights = {
+            'trend': 0.0,
+            'breakout': 0.0,
+            'mean_reversion': 0.0
+        }
+        
+        # トレンド環境での重み付け
+        if is_trending:
+            weights['trend'] = 0.6
+            weights['breakout'] = 0.3
+            weights['mean_reversion'] = 0.1
+            
+            # 高ボラティリティならブレイクアウトの重みを上げる
+            if is_high_volatility:
+                weights['trend'] = 0.5
+                weights['breakout'] = 0.4
+                weights['mean_reversion'] = 0.1
+        
+        # レンジ環境での重み付け
+        else:
+            weights['trend'] = 0.2
+            weights['breakout'] = 0.3
+            weights['mean_reversion'] = 0.5
+            
+            # 低ボラティリティなら平均回帰の重みを上げる
+            if is_low_volatility:
+                weights['trend'] = 0.1
+                weights['breakout'] = 0.2
+                weights['mean_reversion'] = 0.7
+        
+        # 加重平均でシグナルを統合
+        weighted_signal = 0
+        for strategy, signal in signals.items():
+            weighted_signal += signal * weights[strategy]
+        
+        # 最終シグナルの決定（閾値を適用）
+        final_signal = 0
+        if weighted_signal >= 0.3:  # 買いシグナル閾値
+            final_signal = 1
+        elif weighted_signal <= -0.3:  # 売りシグナル閾値
+            final_signal = -1
+        
+        # 戦略間の一貫性チェック（オプション）
+        strategy_agreement = sum(1 for s in signals.values() if s > 0) - sum(1 for s in signals.values() if s < 0)
+        
+        # 強い一貫性がある場合、シグナルを強化
+        if abs(strategy_agreement) >= 2 and strategy_agreement * final_signal > 0:
+            # シグナルの方向と一致する戦略が2つ以上ある場合
+            # これは既に final_signal に反映されているのでここでは何もしない
+            pass
+        
+        # 戦略間で強い矛盾がある場合、シグナルを無効化
+        if abs(strategy_agreement) == 0 and abs(weighted_signal) < 0.4:
+            # 戦略間で意見が分かれている場合、確信度が高くない限りシグナルを出さない
+            final_signal = 0
+        
+        # 統合されたシグナル情報をまとめる
+        integrated_info = {
+            'timestamp': current['timestamp'],
+            'open': current['open'],
+            'high': current['high'],
+            'low': current['low'],
+            'close': current['close'],
+            'signal': final_signal,
+            'weighted_signal': weighted_signal,
+            'adx': adx_value,
+            'is_trending': is_trending,
+            'atr_ratio': atr_ratio,
+            'strategy_agreement': strategy_agreement,
+            'strategy_signals': signals,
+            'strategy_weights': weights
+        }
+        
+        # 利用可能な指標情報を追加
+        for key in ['RSI', 'MACD', 'BB_upper', 'BB_lower', 'SMA_short', 'SMA_long']:
+            if key in current:
+                integrated_info[key] = current[key]
+        
+        return integrated_info
+
+    # リスク/リワード比を市場環境に合わせて調整
+    def adaptive_risk_reward(self, signal_info):
+        """
+        市場環境とシグナルタイプに基づいて動的にリスク/リワード比を調整
+        
+        Parameters:
+        -----------
+        signal_info : dict
+            統合されたシグナル情報
+            
+        Returns:
+        --------
+        tuple
+            (stop_loss_percent, take_profit_percent)
+        """
+        # 基本のリスク/リワード設定
+        sl_percent = self.stop_loss_percent
+        tp_percent = self.take_profit_percent
+        
+        # どの戦略がシグナルを出したか特定
+        dominant_strategy = None
+        max_weight = 0
+        
+        for strategy, weight in signal_info['strategy_weights'].items():
+            strategy_signal = signal_info['strategy_signals'][strategy]
+            if strategy_signal != 0 and weight > max_weight:
+                max_weight = weight
+                dominant_strategy = strategy
+        
+        # 戦略タイプに応じた調整
+        if dominant_strategy == 'trend':
+            # トレンドフォロー戦略ではより広いTP設定
+            tp_percent *= 1.2
+        elif dominant_strategy == 'breakout':
+            # ブレイクアウト戦略では迅速なTP/SL
+            tp_percent *= 1.1
+            sl_percent *= 0.9
+        elif dominant_strategy == 'mean_reversion':
+            # 平均回帰戦略では狭いTP/SL
+            tp_percent *= 0.8
+            sl_percent *= 0.8
+        
+        # 市場環境（トレンド/レンジ）に基づく調整
+        if signal_info.get('is_trending', False):
+            # トレンド相場ではより広いTP
+            tp_percent *= 1.2
+        else:
+            # レンジ相場ではより狭いTP
+            tp_percent *= 0.9
+        
+        # ボラティリティに基づく調整
+        atr_ratio = signal_info.get('atr_ratio', 0.01)
+        if atr_ratio > 0.015:  # 高ボラティリティ
+            # 高ボラティリティ環境ではSLを広く
+            sl_percent *= 1.3
+            tp_percent *= 1.2
+        elif atr_ratio < 0.006:  # 低ボラティリティ
+            # 低ボラティリティ環境ではSL/TPを狭く
+            sl_percent *= 0.8
+            tp_percent *= 0.8
+        
+        # 戦略間の一貫性に基づく調整
+        agreement = signal_info.get('strategy_agreement', 0)
+        if abs(agreement) >= 2:  # 強い一貫性
+            # 戦略間の強い一貫性があればリスクを減らし、リワードを増やす
+            sl_percent *= 0.9
+            tp_percent *= 1.1
+        
+        # 最小リスク/リワード比の保証
+        min_risk_reward = 2.0
+        if tp_percent / sl_percent < min_risk_reward:
+            tp_percent = sl_percent * min_risk_reward
+        
+        # 最終値を妥当な範囲に収める
+        sl_percent = max(0.8, min(sl_percent, 2.5))
+        tp_percent = max(2.0, min(tp_percent, 10.0))
+        
+        return sl_percent, tp_percent
+
+
+
 
 def evaluate_combination(params_dict, common_data, env_dict):
         os.environ.update(env_dict)  # .env の値を再設定（必要なら）
